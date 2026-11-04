@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: filmweb-stremio
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: FILMWEB_USER
+        value: TheSeQuino

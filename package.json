@@ -1,0 +1,9 @@
+{
+  "name": "filmweb-stremio",
+  "version": "1.0.0",
+  "description": "Stremio addon: Filmweb 'chcę zobaczyć' -> katalogi w Stremio",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "stremio-addon-sdk": "^1.6.10" }
+}
