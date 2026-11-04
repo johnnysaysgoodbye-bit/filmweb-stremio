@@ -64,6 +64,23 @@ function pick(metas, q, year) {
   );
 }
 
+// Zapasowe źródło: wyszukiwarka podpowiedzi IMDb (zna też tytuły w oryginale i alternatywne).
+const FOLD = (s) => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/ł/g, "l").replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+async function imdbSuggest(q, type, year) {
+  const f = FOLD(q);
+  if (!f) return null;
+  const letter = /^[a-z0-9]/.test(f) ? f[0] : "x";
+  const okKinds = type === "movie" ? ["movie", "tvMovie", "video", "short"] : ["tvSeries", "tvMiniSeries"];
+  try {
+    const d = await getJson(`https://v2.sg.media-imdb.com/suggestion/${letter}/${encodeURIComponent(f)}.json`, 1);
+    const hit = (d.d || []).find(
+      (x) => /^tt/.test(x.id || "") && okKinds.includes(x.qid) && (!year || !x.y || Math.abs(x.y - year) <= 1)
+    );
+    if (hit) return { id: hit.id, type, name: hit.l, poster: hit.i?.imageUrl || `https://images.metahub.space/poster/small/${hit.id}/img`, year: hit.y };
+  } catch (e) { console.error("imdb-suggest:", e.message); }
+  return null;
+}
+
 async function resolveImdb(info, type) {
   const year = Number(info.year) || null;
   const variants = [];
@@ -79,6 +96,12 @@ async function resolveImdb(info, type) {
       const hit = pick(d.metas || [], q, year);
       if (hit) return { id: hit.imdb_id || hit.id, type, name: hit.name, poster: hit.poster, year: hit.releaseInfo || hit.year };
     } catch (e) { console.error("cinemeta:", e.message); }
+    await sleep(200);
+  }
+  // Cinemeta nie znalazła (częste dla filmów zagranicznych/klasyków) - spróbuj przez IMDb
+  for (const q of [...new Set(variants)]) {
+    const hit = await imdbSuggest(q, type, year);
+    if (hit) return hit;
     await sleep(200);
   }
   return null;
