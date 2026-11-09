@@ -2,28 +2,31 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const fs = require("fs");
 
 const FILMWEB_USER = process.env.FILMWEB_USER || "TheSeQuino";
+const TMDB_KEY = (process.env.TMDB_API_KEY || "").trim(); // klucz v3 (krótki) albo token v4 (zaczyna się od "eyJ")
 const PORT = process.env.PORT || 7000;
 const CACHE_FILE = process.env.CACHE_FILE || "./cache.json";
 const REFRESH_MS = 24 * 60 * 60 * 1000; // raz dziennie
+const ENRICH_VERSION = 2; // podbij, żeby wymusić ponowne pobranie danych z TMDB
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (compatible; filmweb-stremio/1.1)",
+  "User-Agent": "Mozilla/5.0 (compatible; filmweb-stremio/1.2)",
   Accept: "application/json",
 };
 
-// cache: { resolved: { "<filmwebId>": {id,type,name,poster,year} }, lists: { movie: [meta], series: [meta] }, lastRefresh }
+// cache: { resolved: { "<filmwebId>": meta }, lists: { movie: [meta], series: [meta] }, lastRefresh }
 // Do cache trafiają tylko UDANE dopasowania - nieudane są ponawiane przy każdym odświeżeniu.
 let cache = { resolved: {}, lists: { movie: [], series: [] }, lastRefresh: 0 };
 try { cache = { ...cache, ...JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")) }; } catch {}
 const save = () => { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(cache)); } catch (e) { console.error("save:", e.message); } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getJson(url, retries = 2) {
+async function getJson(url, retries = 2, headers = HEADERS) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
     try {
-      const res = await fetch(url, { headers: HEADERS });
+      const res = await fetch(url, { headers });
       if (res.ok) return await res.json();
-      lastErr = new Error(`${res.status} ${url}`);
+      lastErr = new Error(`${res.status} ${url.replace(/api_key=[^&]+/, "api_key=***")}`);
+      if (res.status === 404) break; // nie ma sensu ponawiać
     } catch (e) { lastErr = e; }
     await sleep(800 * (i + 1));
   }
@@ -94,7 +97,7 @@ async function resolveImdb(info, type) {
     try {
       const d = await getJson(`https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(q)}.json`, 1);
       const hit = pick(d.metas || [], q, year);
-      if (hit) return { id: hit.imdb_id || hit.id, type, name: hit.name, poster: hit.poster, year: hit.releaseInfo || hit.year };
+      if (hit) return { id: hit.imdb_id || hit.id, type, name: hit.name, poster: hit.poster, year: hit.releaseInfo || hit.year, imdbRating: hit.imdbRating };
     } catch (e) { console.error("cinemeta:", e.message); }
     await sleep(200);
   }
@@ -107,8 +110,71 @@ async function resolveImdb(info, type) {
   return null;
 }
 
+// --- TMDB: polskie metadane (tytuł, opis, plakat, tło, gatunki, obsada...) ---
+const IMG = "https://image.tmdb.org/t/p";
+function tmdbGet(path, params = "") {
+  const isToken = TMDB_KEY.startsWith("eyJ");
+  const url = `https://api.themoviedb.org/3${path}?language=pl-PL${params}${isToken ? "" : `&api_key=${TMDB_KEY}`}`;
+  const headers = isToken ? { ...HEADERS, Authorization: `Bearer ${TMDB_KEY}` } : HEADERS;
+  return getJson(url, 1, headers);
+}
+const fmtRuntime = (m) => (m ? (m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}min` : `${m}min`) : undefined);
+
+async function enrich(meta) {
+  if (!TMDB_KEY || !/^tt/.test(meta.id || "")) return meta;
+  try {
+    const f = await tmdbGet(`/find/${meta.id}`, "&external_source=imdb_id");
+    let kind = meta.type === "movie" ? "movie" : "tv";
+    let found = (kind === "movie" ? f.movie_results : f.tv_results) || [];
+    if (!found.length) {
+      kind = kind === "movie" ? "tv" : "movie";
+      found = (kind === "movie" ? f.movie_results : f.tv_results) || [];
+    }
+    if (!found.length) { console.warn("TMDB: brak dla", meta.id, meta.name); return meta; }
+
+    const d = await tmdbGet(`/${kind}/${found[0].id}`, "&append_to_response=credits,images&include_image_language=pl,en,null");
+    const posters = d.images?.posters || [];
+    const logos = d.images?.logos || [];
+    const plPoster = posters.find((p) => p.iso_639_1 === "pl")?.file_path;
+    const poster = plPoster || d.poster_path;
+    const logo = (logos.find((l) => l.iso_639_1 === "pl") || logos.find((l) => l.iso_639_1 === "en") || logos[0])?.file_path;
+    const date = d.release_date || d.first_air_date || "";
+    const runtime = kind === "movie" ? d.runtime : (d.episode_run_time || [])[0];
+    const directors = (d.credits?.crew || []).filter((c) => c.job === "Director").map((c) => c.name);
+
+    let imdbRating = meta.imdbRating;
+    if (!imdbRating) {
+      try {
+        const cm = await getJson(`https://v3-cinemeta.strem.io/meta/${meta.type}/${meta.id}.json`, 0);
+        imdbRating = cm.meta?.imdbRating;
+      } catch {}
+    }
+
+    return {
+      ...meta,
+      name: d.title || d.name || meta.name,
+      poster: poster ? `${IMG}/w500${poster}` : meta.poster,
+      posterShape: "poster",
+      background: d.backdrop_path ? `${IMG}/w1280${d.backdrop_path}` : undefined,
+      logo: logo ? `${IMG}/w500${logo}` : undefined,
+      description: d.overview || undefined,
+      genres: (d.genres || []).map((g) => g.name),
+      runtime: fmtRuntime(runtime),
+      releaseInfo: date ? date.slice(0, 4) : meta.releaseInfo || meta.year,
+      released: date ? new Date(date).toISOString() : undefined,
+      imdbRating: imdbRating ? String(imdbRating) : undefined,
+      cast: (d.credits?.cast || []).slice(0, 6).map((c) => c.name),
+      director: directors.length ? directors : undefined,
+      v: ENRICH_VERSION,
+    };
+  } catch (e) {
+    console.warn("TMDB błąd:", meta.id, meta.name, e.message);
+    return meta;
+  }
+}
+
 async function refresh() {
-  console.log(new Date().toISOString(), "odświeżanie list Filmweb dla", FILMWEB_USER);
+  console.log(new Date().toISOString(), "odświeżanie list Filmweb dla", FILMWEB_USER, TMDB_KEY ? "(z TMDB)" : "(BEZ TMDB - ustaw TMDB_API_KEY)");
   for (const [kind, type] of [["film", "movie"], ["serial", "series"]]) {
     let ids;
     try { ids = await fetchWantList(kind); } catch (e) { console.error("lista", kind, e.message); continue; }
@@ -121,16 +187,21 @@ async function refresh() {
         const info = await fetchFilmwebInfo(id);
         await sleep(300);
         meta = info ? await resolveImdb(info, type) : null;
-        if (meta) cache.resolved[id] = meta;
-        else missed.push(`${id}: ${info ? `${info.title} / ${info.original} (${info.year})` : "(brak danych z Filmwebu)"}`);
+        if (!meta) missed.push(`${id}: ${info ? `${info.title} / ${info.original} (${info.year})` : "(brak danych z Filmwebu)"}`);
+      }
+      if (meta && TMDB_KEY && meta.v !== ENRICH_VERSION) {
+        meta = await enrich(meta);
+        await sleep(150);
       }
       if (meta) {
+        cache.resolved[id] = meta;
         metas.push(meta);
         cache.lists[type] = [...metas]; // lista rośnie na bieżąco
       }
     }
     cache.lists[type] = metas;
-    console.log(kind, `– dopasowano ${metas.length}/${ids.length}`);
+    const enriched = metas.filter((m) => m.v === ENRICH_VERSION).length;
+    console.log(kind, `– dopasowano ${metas.length}/${ids.length}` + (TMDB_KEY ? `, z danymi TMDB: ${enriched}` : ""));
     if (missed.length) console.warn("NIEDOPASOWANE", kind + ":\n  " + missed.join("\n  "));
     save();
   }
@@ -150,7 +221,7 @@ function ensureRefresh() {
 // --- Stremio ---
 const builder = new addonBuilder({
   id: "pl.filmweb.watchlist.personal",
-  version: "1.1.0",
+  version: "1.2.0",
   name: "Filmweb",
   description: `Lista „chcę zobaczyć” z Filmweb (${FILMWEB_USER}), odświeżana raz dziennie`,
   resources: ["catalog"],
