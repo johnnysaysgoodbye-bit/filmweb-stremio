@@ -5,7 +5,7 @@ const FILMWEB_USER = process.env.FILMWEB_USER || "TheSeQuino";
 const TMDB_KEY = (process.env.TMDB_API_KEY || "").trim(); // klucz v3 (krótki) albo token v4 (zaczyna się od "eyJ")
 const PORT = process.env.PORT || 7000;
 const CACHE_FILE = process.env.CACHE_FILE || "./cache.json";
-const REFRESH_MS = 24 * 60 * 60 * 1000; // raz dziennie
+const REFRESH_MS = Number(process.env.REFRESH_HOURS || 24) * 60 * 60 * 1000; // domyślnie raz dziennie
 const ENRICH_VERSION = 2; // podbij, żeby wymusić ponowne pobranie danych z TMDB
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (compatible; filmweb-stremio/1.2)",
@@ -244,3 +244,5 @@ builder.defineCatalogHandler(async ({ type }) => {
 
 serveHTTP(builder.getInterface(), { port: PORT });
 ensureRefresh();
+// Co godzinę sprawdź, czy dane są starsze niż REFRESH_MS - niezależnie od tego, czy ktoś otwiera katalog.
+setInterval(() => { if (Date.now() - cache.lastRefresh > REFRESH_MS) ensureRefresh(); }, 60 * 60 * 1000);
